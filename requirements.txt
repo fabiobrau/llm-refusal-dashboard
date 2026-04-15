@@ -1,0 +1,11 @@
+torch>=2.1.0
+transformers>=4.45.0,<5.0.0
+gradio>=4.44.0
+datasets
+pandas
+accelerate
+matplotlib
+protobuf
+sentencepiece
+tokenizers>=0.20
+huggingface_hub>=0.24
