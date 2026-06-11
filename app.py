@@ -30,6 +30,7 @@ state = {
     "device": None,
     "harmful_acts": None,
     "harmless_acts": None,
+    "stop_event": None,
 }
 
 
@@ -222,19 +223,33 @@ def chat_fn(message, history, layer_start, layer_end, beta_val):
     partial = ""
     history = history + [{"role": "assistant", "content": ""}]
 
-    for token in generate_with_steering(
-        model=state["model"],
-        tokenizer=state["tokenizer"],
-        messages=messages_for_model,
-        refusal_dir=state["refusal_dir"],
-        beta=beta_val,
-        layer_start=int(layer_start),
-        layer_end=int(layer_end),
-        device=state["device"],
-    ):
-        partial += token
-        history[-1]["content"] = partial
-        yield history, gr.update()
+    stop_event = threading.Event()
+    state["stop_event"] = stop_event
+
+    try:
+        for token in generate_with_steering(
+            model=state["model"],
+            tokenizer=state["tokenizer"],
+            messages=messages_for_model,
+            refusal_dir=state["refusal_dir"],
+            beta=beta_val,
+            layer_start=int(layer_start),
+            layer_end=int(layer_end),
+            device=state["device"],
+            stop_event=stop_event,
+        ):
+            partial += token
+            history[-1]["content"] = partial
+            yield history, gr.update()
+    finally:
+        if state.get("stop_event") is stop_event:
+            state["stop_event"] = None
+
+
+def stop_generation():
+    ev = state.get("stop_event")
+    if ev is not None:
+        ev.set()
 
 
 def use_selected_prompt(prompt):
@@ -307,10 +322,16 @@ with gr.Blocks(title="Refusal Suppression Dashboard") as demo:
                 )
                 with gr.Row():
                     send_btn = gr.Button("Send", variant="primary")
+                    stop_btn = gr.Button("Stop", variant="stop")
                     clear_btn = gr.Button("Clear Chat")
             with gr.Column(scale=1):
                 heatmap_plot = gr.Plot(
                     label="Cosine similarity of your latest message vs. Δmean per layer"
+                )
+                gr.Markdown(
+                    "Each column uses its own layer-specific Δmean "
+                    "(harmful mean − harmless mean at that layer), not the single "
+                    "centroid vector selected above."
                 )
 
     # --- Event wiring ---
@@ -336,17 +357,21 @@ with gr.Blocks(title="Refusal Suppression Dashboard") as demo:
         outputs=[msg],
     )
 
-    send_btn.click(
+    send_event = send_btn.click(
         fn=chat_fn,
         inputs=[msg, chatbot, layer_start_slider, layer_end_slider, beta_slider],
         outputs=[chatbot, heatmap_plot],
     ).then(fn=lambda: "", outputs=[msg])
 
-    msg.submit(
+    submit_event = msg.submit(
         fn=chat_fn,
         inputs=[msg, chatbot, layer_start_slider, layer_end_slider, beta_slider],
         outputs=[chatbot, heatmap_plot],
     ).then(fn=lambda: "", outputs=[msg])
+
+    stop_btn.click(
+        fn=stop_generation, cancels=[send_event, submit_event]
+    )
 
     clear_btn.click(fn=lambda: [], outputs=[chatbot])
 

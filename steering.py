@@ -6,7 +6,13 @@ import numpy as np
 import pandas as pd
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    StoppingCriteria,
+    StoppingCriteriaList,
+    TextIteratorStreamer,
+)
 
 SUPPORTED_MODELS = {
     "Llama-3.2-1B-Instruct": "meta-llama/Llama-3.2-1B-Instruct",
@@ -301,6 +307,11 @@ class SteeringContext:
             proj_coeff = torch.einsum("d, ...d -> ...", r, h_f32)
             h_steered = (h_f32 - beta * proj_coeff.unsqueeze(-1) * r).to(orig_dtype)
 
+            # Large β can push values past the dtype's range, producing inf/NaN
+            # that corrupt later layers and crash sampling. Keep original where bad.
+            if not torch.isfinite(h_steered).all():
+                h_steered = torch.where(torch.isfinite(h_steered), h_steered, h)
+
             if isinstance(output, tuple):
                 return (h_steered,) + output[1:]
             return h_steered
@@ -332,6 +343,14 @@ class SteeringContext:
 # ---------------------------------------------------------------------------
 
 
+class _StopOnEvent(StoppingCriteria):
+    def __init__(self, event: threading.Event):
+        self.event = event
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        return self.event.is_set()
+
+
 def generate_with_steering(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -342,6 +361,7 @@ def generate_with_steering(
     layer_end: int,
     device: str,
     max_new_tokens: int = 512,
+    stop_event: threading.Event | None = None,
 ) -> Generator[str, None, None]:
     inputs = tokenizer.apply_chat_template(
         messages,
@@ -371,13 +391,33 @@ def generate_with_steering(
         temperature=0.7,
         top_p=0.9,
     )
+    if stop_event is not None:
+        gen_kwargs["stopping_criteria"] = StoppingCriteriaList(
+            [_StopOnEvent(stop_event)]
+        )
 
-    thread = threading.Thread(target=model.generate, kwargs=gen_kwargs)
+    error_holder: dict = {"error": None}
+
+    def _run_generate():
+        try:
+            model.generate(**gen_kwargs)
+        except Exception as e:
+            error_holder["error"] = e
+        finally:
+            # Always signal the consumer so it doesn't hang on the queue.
+            streamer.end()
+
+    thread = threading.Thread(target=_run_generate)
     thread.start()
 
     try:
         for text in streamer:
             yield text
+        if error_holder["error"] is not None:
+            yield f"\n\n[Generation failed: {error_holder['error']}]"
     finally:
+        # Ensure the thread exits promptly even if the consumer stops early.
+        if stop_event is not None:
+            stop_event.set()
         thread.join()
         ctx.remove_hooks()
